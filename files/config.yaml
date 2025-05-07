@@ -1,0 +1,25 @@
+name: mysite
+
+type: drupal9
+docroot: docroot
+php_version: "8.3"
+webserver_type: nginx-fpm
+router_http_port: "80"
+router_https_port: "443"
+xdebug_enabled: false
+additional_hostnames: [ ]
+additional_fqdns: [ ]
+database:
+  type: mariadb
+  version: "10.3"
+hooks:
+  post-start:
+    - exec: '[ -f docroot/sites/default/settings.ddev.php ] && echo "Settings file already exists." || cp docroot/sites/default/settings.ddev.php.dist docroot/sites/default/settings.ddev.php'
+webimage_extra_packages: [ build-essential ]
+use_dns_when_possible: true
+composer_version: "2"
+disable_settings_management: true
+web_environment:
+  - DRUSH_OPTIONS_URI=https://mysite.ddev.site
+  - ACQUIA_ENVIRONMENT_ID=mysite8.mysitedev
+nodejs_version: "16"

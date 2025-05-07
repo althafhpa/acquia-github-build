@@ -1,0 +1,435 @@
+name: Refresh Acquia mysitedev
+
+on:
+  #schedule:
+    # Run once a day at midnight UTC
+    # - cron: '0 0 * * *'
+  workflow_dispatch: # Allow manual triggering
+
+env:
+  # Always prioritize secrets over hardcoded values
+  ACQUIA_API_KEY: ${{ secrets.ACQUIA_API_KEY }}
+  ACQUIA_API_SECRET: ${{ secrets.ACQUIA_API_SECRET }}
+  SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+  SSH_KNOWN_HOSTS: ${{ secrets.SSH_KNOWN_HOSTS }}
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      - name: Install DDEV
+        run: |
+          curl -LO https://raw.githubusercontent.com/drud/ddev/master/scripts/install_ddev.sh
+          bash install_ddev.sh
+          rm install_ddev.sh
+
+      - name: Set up SSH key
+        run: |
+          mkdir -p ~/.ssh
+          if [ -n "$SSH_PRIVATE_KEY" ]; then
+            echo "$SSH_PRIVATE_KEY" > ~/.ssh/id_rsa
+          else
+            echo "Error: SSH_PRIVATE_KEY secret is not set. Please add it to your repository secrets."
+            exit 1
+          fi
+          chmod 600 ~/.ssh/id_rsa
+          echo "$SSH_KNOWN_HOSTS" >> ~/.ssh/known_hosts
+          eval "$(ssh-agent -s)"
+          ssh-add ~/.ssh/id_rsa
+
+      - name: Configure DDEV with Acquia API credentials
+        run: |
+          mkdir -p ~/.ddev
+          cat > ~/.ddev/global_config.yaml << 'EOF'
+          web_environment:
+          - ACQUIA_API_KEY=${ACQUIA_API_KEY}
+          - ACQUIA_API_SECRET=${ACQUIA_API_SECRET}
+          EOF
+          echo "DDEV configured with Acquia API credentials."
+
+      - name: Merge mysitedev-main with master branch on Acquia repository
+        run: |
+          git clone mysite@svn-xxxx.prod.hosting.acquia.com:mysite.git
+          cd mysite
+          git fetch origin
+          git checkout master
+          git checkout -b mysitedev-main origin/mysitedev-main
+          git merge -X theirs master
+          git diff --quiet && git diff --staged --quiet || git commit -m "Merge master into mysitedev with master's changes taking precedence"
+          git push origin mysitedev-main
+          echo "Code merge completed."
+
+      - name: Copy DDEV configuration config.yaml from local directory
+        run: |
+          pwd
+          ls -la
+          cd mysite
+          mkdir -p .ddev
+          cp $GITHUB_WORKSPACE/files/config.yaml ./.ddev/
+          echo "DDEV configuration copied."
+
+      - name: Start ddev
+        run: |
+          cd mysite
+          echo "Starting ddev..."
+          ddev start
+
+      - name: Set up non-interactive SSH for DDEV
+        run: |
+          cd mysite
+          mkdir -p .ddev/commands/host/
+          cat > .ddev/commands/host/auth-ssh << 'EOF'
+          #!/bin/bash
+          echo "This is a non-interactive version of ddev auth ssh for CI environments"
+          set -e
+
+          echo "Setting up SSH authentication for DDEV..."
+          mkdir -p ~/.ddev-ssh-agent-keys
+          echo "Copy the SSH key to the directory that will be mounted into the container"
+          cp ~/.ssh/id_rsa ~/.ddev-ssh-agent-keys/
+          chmod 600 ~/.ddev-ssh-agent-keys/id_rsa
+
+          echo "Check if the SSH agent container is already running..."
+          if docker ps --filter "name=ddev-ssh-agent" --format "{{.Names}}" | grep -q "ddev-ssh-agent"; then
+            echo "Stopping existing DDEV SSH agent container..."
+            docker stop ddev-ssh-agent || true
+            docker rm ddev-ssh-agent || true
+          fi
+
+          echo "Starting DDEV SSH agent container..."
+          echo "Using fixed SSH agent image version"
+
+          # Start the SSH agent container with a known working version
+          docker run --rm -d --name=ddev-ssh-agent -u $(id -u):$(id -g) -v ~/.ddev-ssh-agent-keys:/keys ddev/ddev-ssh-agent:latest
+
+          echo "Adding SSH key to agent..."
+          docker exec ddev-ssh-agent ssh-add /keys/id_rsa
+          echo "Verifying SSH key was added..."
+          docker exec ddev-ssh-agent ssh-add -l
+          echo "SSH key successfully added to DDEV SSH agent"
+          EOF
+
+          chmod +x .ddev/commands/host/auth-ssh
+
+      - name: Create custom Acquia database pull command
+        run: |
+          cd mysite
+          mkdir -p .ddev/commands/web
+          cat > .ddev/commands/web/acquia-pull-db << 'EOF'
+          #!/bin/bash
+          
+          set -e
+          
+          # This script uses acli to pull a database from Acquia
+          
+          # Check if environment ID is provided
+          if [ -z "$1" ]; then
+            echo "Please provide an environment ID (e.g. mysite.mysitedev)"
+            exit 1
+          fi
+          
+          ENVIRONMENT_ID=$1
+          
+          echo "Pulling database from Acquia environment: $ENVIRONMENT_ID"
+          
+          # Create a temporary directory
+          TEMP_DIR=$(mktemp -d)
+          
+          # Download the database using acli
+          echo "Downloading database from Acquia..."
+          acli pull:db $ENVIRONMENT_ID default --no-interaction --no-import > $TEMP_DIR/pull_output.txt
+          
+          # Extract the path to the downloaded file
+          DB_DUMP=$(cat $TEMP_DIR/pull_output.txt | grep -o '/tmp/.*\.sql\.gz' | tail -1)
+          
+          if [ -z "$DB_DUMP" ]; then
+            echo "Failed to extract database dump path from acli output"
+            cat $TEMP_DIR/pull_output.txt
+            exit 1
+          fi
+          
+          echo "Database downloaded to: $DB_DUMP"
+          
+          # Copy the database dump to a location where it can be imported
+          mkdir -p /var/www/html/.ddev/.downloads
+          cp $DB_DUMP /var/www/html/.ddev/.downloads/db.sql.gz
+          
+          # Clean up
+          rm -rf $TEMP_DIR
+          
+          # Exit the container to run import-db from host
+          exit 0
+          EOF
+          
+          echo "Make the script executable"
+          chmod +x .ddev/commands/web/acquia-pull-db
+          echo "Custom Acquia database pull command created."
+
+      - name: Create custom Acquia database sync command
+        run: |
+          cd mysite
+          mkdir -p .ddev/commands/web
+          cat > .ddev/commands/web/acquia-sync-db << 'EOF'
+          #!/bin/bash
+          set -e
+
+          # Check if source and target environments are provided
+          if [ -z "$1" ] || [ -z "$2" ]; then
+            echo "Please provide source and target environment names"
+            echo "Usage: acquia-sync-db <source-env> <target-env>"
+            exit 1
+          fi
+
+          SOURCE_ENV="mysite.$1"
+          TARGET_ENV="mysite.$2"
+
+          echo "Syncing database from $SOURCE_ENV to $TARGET_ENV..."
+
+          # Drop the target database
+          echo "Dropping target database..."
+          acli remote:drush $TARGET_ENV -- sql-drop -y
+
+          # Sync the database
+          echo "Syncing database..."
+          acli remote:drush $TARGET_ENV -- sql-sync @$SOURCE_ENV @self -y
+
+          # Clear cache
+          echo "Clearing cache..."
+          acli remote:drush $TARGET_ENV -- cr
+
+          echo "Database sync completed successfully"
+          EOF
+
+          chmod +x .ddev/commands/web/acquia-sync-db
+
+      - name: Pull database from mysitedev environment
+        run: |
+          cd mysite
+          ddev auth-ssh
+          ddev exec 'acli auth:login --key=${ACQUIA_API_KEY} --secret=${ACQUIA_API_SECRET} --no-interaction'
+          echo "Pulling database from mysitedev environment..."
+          ddev acquia-pull-db mysite.mysitedev
+          echo "Database downloaded from mysitedev environment."
+
+      - name: Import the database from mysitedev environment
+        run: |
+          cd mysite
+          echo "Importing database from mysitedev environment..."
+          ddev import-db --file=.ddev/.downloads/db.sql.gz
+          echo "Database import from mysitedev completed."
+
+      - name: Export mysitedev environment database configuration
+        run: |
+          cd mysite
+          echo "Exporting mysitedev configuration..."
+          ddev drush cst
+          ddev drush cex -y
+          echo "mysitedev configuration exported."
+
+      - name: Pull database from prod environment
+        run: |
+          cd mysite
+          echo "Pulling database from prod environment..."
+          ddev acquia-pull-db mysite.prod
+          echo "Database downloaded from prod environment."
+
+      - name: Import the database from prod environment
+        run: |
+          cd mysite
+          echo "Importing database from prod environment..."
+          ddev import-db --file=.ddev/.downloads/db.sql.gz
+          ddev drush cr
+          echo "Database import from prod completed."
+
+      - name: Install Composer dependencies
+        run: |
+          cd mysite
+          echo "Installing Composer dependencies..."
+          ddev composer install --no-interaction
+          ddev drush cr
+          echo "Composer dependencies installed successfully."
+
+      - name: Compare and selectively import mysitedev configuration with module merging
+        run: |
+          cd mysite
+          echo "Comparing configurations between active (database) and sync directory..."
+
+          # Check if there are any configuration differences
+          CONFIG_DIFF=$(ddev drush config:status --format=list 2>/dev/null || ddev drush config-status --format=list 2>/dev/null)
+          
+          if [ -z "$CONFIG_DIFF" ]; then
+            echo "No configuration differences found, skipping import."
+            exit 0
+          fi
+          
+          echo "Configuration differences found:"
+          echo "$CONFIG_DIFF"
+          
+          # Set the config directory path
+          CONFIG_DIR="config-export"
+          echo "Using config directory: $CONFIG_DIR"
+          
+          # Create directory for our comparison
+          mkdir -p /tmp/config-diff
+          
+          # Extract enabled modules from mysitedev config file
+          echo "Extracting enabled modules from mysitedev config file..."
+          grep -A 100 "^module:" $CONFIG_DIR/core.extension.yml | grep -v "^module:" | grep -v "^_core:" | grep -v "^  profiles:" | awk '{print $1}' > /tmp/config-diff/mysitedev-modules.txt
+          
+          # Get list of enabled modules in prod database
+          echo "Getting list of enabled modules in prod database..."
+          ddev exec "drush pm:list --status=enabled --format=list" > /tmp/config-diff/prod-modules.txt
+          
+          # Debug: Show the prod modules
+          echo "Modules enabled in prod txt:"
+          cat /tmp/config-diff/prod-modules.txt
+          
+          # Debug: Show the mysitedev modules
+          echo "Modules in mysitedev config txt:"
+          cat /tmp/config-diff/mysitedev-modules.txt
+            
+          # Compare modules using Bash arrays
+          echo "Identifying modules in mysitedev but not in prod..."
+
+          # Read mysitedev modules into an array
+          mapfile -t mysitedev_MODULES < /tmp/config-diff/mysitedev-modules.txt
+
+          # Read prod modules into an array
+          mapfile -t PROD_MODULES < /tmp/config-diff/prod-modules.txt
+
+          # Debug: Show the prod modules array
+          echo "Modules enabled in prod array:"
+          printf '%s\n' "${PROD_MODULES[@]}"
+
+          # Debug: Show the mysitedev modules array
+          echo "Modules in mysitedev config array:"
+          printf '%s\n' "${mysitedev_MODULES[@]}"
+
+          # Create an empty array for modules to enable
+          MODULES_TO_ENABLE=()
+
+          # Compare the arrays
+          for module in "${mysitedev_MODULES[@]}"; do
+            # Check if module is in PROD_MODULES array
+            if ! printf '%s\n' "${PROD_MODULES[@]}" | grep -q "^${module}$"; then
+              MODULES_TO_ENABLE+=("$module")
+              echo "Module to enable: $module"
+            fi
+          done
+
+          # Write the modules to enable to a file if needed for later steps
+          printf '%s\n' "${MODULES_TO_ENABLE[@]}" > /tmp/config-diff/modules-to-enable.txt
+
+      - name: Export configurations that includes mysitedev and prod
+        run: |
+          cd mysite
+          echo "Exporting configuration..."
+          ddev drush cex -y
+          echo "Configuration exported."
+
+      - name: Verify Drupal site functionality
+        run: |
+          cd mysite
+          echo "Checking if Drupal site is functioning properly..."
+          
+          # First, check if Drupal is installed and bootstrap correctly
+          echo "Checking Drupal status..."
+          DRUPAL_STATUS=$(ddev drush status --field=bootstrap)
+          if [ "$DRUPAL_STATUS" != "Successful" ]; then
+            echo "Error: Drupal bootstrap failed with status: $DRUPAL_STATUS"
+            ddev drush status
+            exit 1
+          fi
+          echo "Drupal bootstrap successful"
+          
+          # Check if we can log in as admin using drush uli
+          echo "Checking admin login functionality..."
+          ADMIN_LOGIN=$(ddev drush uli 2>&1)
+          if [[ $ADMIN_LOGIN == *"Error"* ]]; then
+            echo "Error generating admin login link: $ADMIN_LOGIN"
+            exit 1
+          fi
+          echo "Admin login link generated successfully: $ADMIN_LOGIN"
+          
+          # Check if important modules are enabled
+          echo "Checking if required modules are enabled..."
+          for MODULE in node views field admin_toolbar; do
+            MODULE_STATUS=$(ddev drush pm-list --status=enabled --field=name | grep -w "$MODULE" || echo "")
+            if [ -z "$MODULE_STATUS" ]; then
+              echo "Warning: Required module $MODULE is not enabled"
+            else
+              echo "Module $MODULE is enabled"
+            fi
+          done
+          
+          # Check if we can access views
+          echo "Checking views..."
+          VIEWS_LIST=$(ddev drush views:list --format=list 2>/dev/null)
+          if [ -z "$VIEWS_LIST" ]; then
+            echo "Warning: No views found"
+          else
+            echo "Views found. Sample views: $(echo "$VIEWS_LIST" | head -n 5)"
+          fi
+          
+          # Clear cache and check status
+          echo "Clearing cache..."
+          CACHE_CLEAR=$(ddev drush cr 2>&1)
+          if [[ $CACHE_CLEAR == *"Error"* ]]; then
+            echo "Warning: Cache clear failed: $CACHE_CLEAR"
+          else
+            echo "Cache cleared successfully"
+          fi
+          
+          echo "All Drupal site functionality checks passed!"
+
+      - name: Git commit the configurations
+        run: |
+          cd mysite
+          echo "Committing the configuration changes..."
+          git config --global user.email "github-actions@github.com"
+          git config --global user.name "GitHub Actions"
+          
+          echo "Only stage the configuration export files, nothing else"
+          git add config-export/
+          
+          echo "Commit and push if there are changes in the staged files"
+          git diff --staged --quiet || (git commit -m "Configuration changes including both mysitedev and prod" && git push origin mysitedev-main)
+          
+          echo "Configuration changes committed."
+
+      - name: Sync database from prod to mysitedev
+        run: |
+          cd mysite
+          ddev auth-ssh
+          echo "Syncing database from prod to mysitedev environment..."
+          ddev acquia-sync-db prod mysitedev
+          echo "Database sync completed."
+
+      - name: Import configuration to mysitedev environment
+        run: |
+          cd mysite
+          echo "Importing configuration to mysitedev environment..."
+          ddev exec 'acli remote:drush mysite.mysitedev -- cim -y'
+          ddev exec 'acli remote:drush mysite.mysitedev -- cr'
+          echo "Configuration import completed."
+
+      - name: Clear mysitedev environment cache
+        run: |
+          cd mysite
+          ddev drush @mysite.mysitedev cr
+        
+      - name: Cleanup
+        if: always()
+        run: |
+          cd mysite
+          ddev stop
+          ddev poweroff
+          rm -rf ~/.ssh/id_rsa || true
+          rm -rf ~/.ddev-ssh-agent-keys || true
+          echo "Cleanup completed."
+
+      - name: Clear mysitedev environment cache
+        run: echo "Deployment Complete!"
